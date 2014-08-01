@@ -2,6 +2,15 @@ from django.core.exceptions import SuspiciousOperation, ImproperlyConfigured
 from django.contrib.admin.views.main import ChangeList, ORDER_VAR
 from django.contrib.admin.options import IncorrectLookupParameters
 from django.core.paginator import InvalidPage
+from django.contrib.admin.util import (get_fields_from_path,
+    lookup_needs_distinct, prepare_lookup_value)
+from django.utils import six
+from django.db.models.fields import FieldDoesNotExist
+from django.contrib.admin.exceptions import DisallowedModelAdminLookup
+from django.utils.encoding import force_str
+
+from mongoengine.fields import BaseField
+from filters import FieldListFilter
 
 class DocumentChangeList(ChangeList):
     def get_queryset(self, request):
@@ -78,7 +87,8 @@ class DocumentChangeList(ChangeList):
                     continue # Invalid ordering specified, skip it.
 
         # Add the given query's ordering fields, if any.
-        ordering.extend(queryset._ordering)
+        if queryset._ordering:
+            ordering.extend(queryset._ordering)
 
         # Ensure that the primary key is systematically present in the list of
         # ordering fields so we can guarantee a deterministic order across all
@@ -122,3 +132,62 @@ class DocumentChangeList(ChangeList):
         self.can_show_all = can_show_all
         self.multi_page = multi_page
         self.paginator = paginator
+
+    def get_filters(self, request):
+        lookup_params = self.get_filters_params()
+        use_distinct = False
+
+        # Normalize the types of keys
+        for key, value in lookup_params.items():
+            if not isinstance(key, str):
+                # 'key' will be used as a keyword argument later, so Python
+                # requires it to be a string.
+                del lookup_params[key]
+                lookup_params[force_str(key)] = value
+
+            if not self.model_admin.lookup_allowed(key, value):
+                raise DisallowedModelAdminLookup("Filtering by %s not allowed" % key)
+
+        filter_specs = []
+        if self.list_filter:
+            for list_filter in self.list_filter:
+                if callable(list_filter):
+                    # This is simply a custom list filter class.
+                    spec = list_filter(request, lookup_params,
+                        self.model, self.model_admin)
+                else:
+                    field_path = None
+                    if isinstance(list_filter, (tuple, list)):
+                        # This is a custom FieldListFilter class for a given field.
+                        field, field_list_filter_class = list_filter
+                    else:
+                        # This is simply a field name, so use the default
+                        # FieldListFilter class that has been registered for
+                        # the type of the given field.
+                        field, field_list_filter_class = list_filter, FieldListFilter.create
+                    if not isinstance(field, BaseField):
+                        field_path = field
+                        field = get_fields_from_path(self.model, field_path)[-1]
+                    spec = field_list_filter_class(field, request, lookup_params,
+                        self.model, self.model_admin, field_path=field_path)
+                    # Check if we need to use distinct()
+                    use_distinct = (use_distinct or
+                                    lookup_needs_distinct(self.lookup_opts,
+                                                          field_path))
+                if spec and spec.has_output():
+                    filter_specs.append(spec)
+
+        # At this point, all the parameters used by the various ListFilters
+        # have been removed from lookup_params, which now only contains other
+        # parameters passed via the query string. We now loop through the
+        # remaining parameters both to ensure that all the parameters are valid
+        # fields and to determine if at least one of them needs distinct(). If
+        # the lookup parameters aren't real fields, then bail out.
+        try:
+            for key, value in lookup_params.items():
+                lookup_params[key] = prepare_lookup_value(key, value)
+                use_distinct = (use_distinct or
+                                lookup_needs_distinct(self.lookup_opts, key))
+            return filter_specs, bool(filter_specs), lookup_params, use_distinct
+        except FieldDoesNotExist as e:
+            six.reraise(IncorrectLookupParameters, IncorrectLookupParameters(e), sys.exc_info()[2])

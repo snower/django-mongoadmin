@@ -1,11 +1,12 @@
 import collections
 from functools import partial
+import operator
 
 from django import forms
 from django.forms.models import modelform_defines_fields
 from django.contrib.admin.options import ModelAdmin, InlineModelAdmin, get_ul_class
 from django.contrib.admin import widgets
-from django.contrib.admin.util import flatten_fieldsets
+from django.contrib.admin.util import flatten_fieldsets, lookup_needs_distinct
 from django.core.exceptions import FieldError, ValidationError
 from django.forms.formsets import DELETION_FIELD_NAME
 from django.utils.translation import ugettext as _
@@ -14,6 +15,7 @@ from django.utils.text import get_text_list
 
 from mongoengine.fields import (DateTimeField, URLField, IntField, ListField, EmbeddedDocumentField,
                                 ReferenceField, StringField, FileField, ImageField)
+from mongoengine.queryset.visitor import Q
 
 from mongodbforms.documents import documentform_factory, embeddedformset_factory, DocumentForm, EmbeddedDocumentFormSet, EmbeddedDocumentForm
 from mongodbforms.util import load_field_generator, init_document_options
@@ -290,6 +292,90 @@ class DocumentAdmin(MongoFormFieldMixin, ModelAdmin):
             print(e.message)
             raise FieldError('%s. Check fields/fieldsets/exclude attributes of class %s.'
                              % (e, self.__class__.__name__))
+
+    def get_search_results(self, request, queryset, search_term):
+        """
+        Returns a tuple containing a queryset to implement the search,
+        and a boolean indicating if the results may contain duplicates.
+        """
+        # Apply keyword searches.
+        def construct_search(field_name):
+            if field_name.startswith('^'):
+                return "%s__istartswith" % field_name[1:]
+            elif field_name.startswith('='):
+                return "%s__iexact" % field_name[1:]
+            elif field_name.startswith('@'):
+                return "%s__search" % field_name[1:]
+            else:
+                return "%s__icontains" % field_name
+
+        use_distinct = False
+        if self.search_fields and search_term:
+            orm_lookups = [construct_search(str(search_field))
+                           for search_field in self.search_fields]
+            for bit in search_term.split():
+                or_queries = [Q(**{orm_lookup: bit})
+                              for orm_lookup in orm_lookups]
+                queryset = queryset.filter(reduce(operator.or_, or_queries))
+            if not use_distinct:
+                for search_spec in orm_lookups:
+                    if lookup_needs_distinct(self.opts, search_spec):
+                        use_distinct = True
+                        break
+
+        return queryset, use_distinct
+
+    def lookup_allowed(self, lookup, value):
+        return True
+        from django.db.models.related import RelatedObject
+        from django.db.models.constants import LOOKUP_SEP
+        from django.db.models.sql.constants import QUERY_TERMS
+        from django.db.models.fields import BLANK_CHOICE_DASH, FieldDoesNotExist
+        model = self.model
+        # Check FKey lookups that are allowed, so that popups produced by
+        # ForeignKeyRawIdWidget, on the basis of ForeignKey.limit_choices_to,
+        # are allowed to work.
+        for l in model._meta.related_fkey_lookups:
+            for k, v in widgets.url_params_from_lookup_dict(l).items():
+                if k == lookup and v == value:
+                    return True
+
+        parts = lookup.split(LOOKUP_SEP)
+
+        # Last term in lookup is a query term (__exact, __startswith etc)
+        # This term can be ignored.
+        if len(parts) > 1 and parts[-1] in QUERY_TERMS:
+            parts.pop()
+
+        # Special case -- foo__id__exact and foo__id queries are implied
+        # if foo has been specificially included in the lookup list; so
+        # drop __id if it is the last part. However, first we need to find
+        # the pk attribute name.
+        pk_attr_name = None
+        for part in parts[:-1]:
+            field, _, _, _ = model._meta.get_field_by_name(part)
+            if hasattr(field, 'rel'):
+                model = field.rel.to
+                pk_attr_name = model._meta.pk.name
+            elif isinstance(field, RelatedObject):
+                model = field.model
+                pk_attr_name = model._meta.pk.name
+            else:
+                pk_attr_name = None
+        if pk_attr_name and len(parts) > 1 and parts[-1] == pk_attr_name:
+            parts.pop()
+
+        try:
+            self.model._meta.get_field_by_name(parts[0])
+        except FieldDoesNotExist:
+            # Lookups on non-existants fields are ok, since they're ignored
+            # later.
+            return True
+        else:
+            if len(parts) == 1:
+                return True
+            clean_lookup = LOOKUP_SEP.join(parts)
+            return clean_lookup in self.list_filter or clean_lookup == self.date_hierarchy
 
     def save_related(self, request, form, formsets, change):
         """
